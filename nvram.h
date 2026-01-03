@@ -32,19 +32,19 @@ int nvram_commit(void);
 // Given a key, gets the corresponding NVRAM value. If key is non-existent, returns NULL.
 // Will dynamically allocate memory, so the user should call free().
 // On MIPS, will use $a1 as key if $a0 is NULL.
-char *nvram_get(const char *key);
+char *nvram_get(const char *key, const char *func_name, int enable_llm);
 // Given a key, gets the corresponding NVRAM value. If key is non-existent, returns "".
 // Will dynamically allocate memory.
-char *nvram_safe_get(const char *key);
+char *nvram_safe_get(const char *key, const char *func_name);
 // Given a key, gets the corresponding NVRAM value. If key is non-existent, returns val.
 // Otherwise, returns NULL. Will dynamically allocate memory.
 char *nvram_default_get(const char *key, const char *val);
 // Given a key, gets the corresponding NVRAM value into a user-supplied buffer.
 // Will hold lock.
-int nvram_get_buf(const char *key, char *buf, size_t sz);
+int nvram_get_buf(const char *key, char *buf, size_t sz, const char *func_name);
 // Given a key, gets the corresponding NVRAM value as integer. If key is non-existent, returns E_FAILURE.
 // Will hold lock.
-int nvram_get_int(const char *key);
+int nvram_get_int(const char *key, const char *func_name);
 // Gets all NVRAM keys and values into a user-supplied buffer, of the format "key=value...".
 // Will hold lock.
 int nvram_getall(char *buf, size_t len);
@@ -67,8 +67,8 @@ char *nvram_list_exist(const char *key, const char *val, int magic);
 int nvram_list_del(const char *key, const char *val);
 
 // Given a key, checks whether the corresponding NVRAM value matches val.
-int nvram_match(const char *key, const char *val);
+int nvram_match(const char *key, const char *val, const char *func_name);
 // Given a key, checks whether the corresponding NVRAM value does not match val.
-int nvram_invmatch(const char *key, const char *val);
+int nvram_invmatch(const char *key, const char *val, const char *func_name);
 
 #endif

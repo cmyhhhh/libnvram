@@ -18,7 +18,7 @@
 #include "nvram.h"
 #include "config.h"
 
-/* Generate variable declarations for external NVRAM data. */
+/* 加载可能在固件中存在的默认NVRAM配置文件 */
 #define NATIVE(a, b)
 #define PATH(a)
 #define TABLE(a) \
@@ -32,14 +32,18 @@
 // https://lkml.org/lkml/2007/3/9/10
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + sizeof(typeof(int[1 - 2 * !!__builtin_types_compatible_p(typeof(arr), typeof(&arr[0]))])) * 0)
 
-#define PRINT_MSG(fmt, ...) do { if (DEBUG) { fprintf(stderr, "%s: "fmt, __FUNCTION__, __VA_ARGS__); } } while (0)
+#define PRINT_MSG(fmt, ...) do { if (DEBUG) { fprintf(stderr, "%s: "fmt, __FUNCTION__, ##__VA_ARGS__); } } while (0)
 
 /* Weak symbol definitions for library functions that may not be present */
+// 防止固件的lib库中没有ftok函数，IPC可能会被裁剪掉
 __typeof__(ftok) __attribute__((weak)) ftok;
 
 /* Global variables */
 static int init = 0;
 static char temp[BUFFER_SIZE];
+// 全局标志，用于控制是否记录默认键
+static int recording_defaults = 0;
+static FILE *defaults_list_fp = NULL;
 
 static int sem_get() {
     int key, semid = 0;
@@ -58,6 +62,8 @@ static int sem_get() {
     };
 
     // Generate key for semaphore based on the mount point
+    // 如果固件没有ftok函数，信号量机制失效，加锁和解锁操作都会失败并返回
+    // 但 NVRAM 操作仍能执行，只是失去了并发保护
     if (!ftok || (key = ftok(MOUNT_POINT, IPC_KEY)) == -1) {
         PRINT_MSG("%s\n", "Unable to get semaphore key!");
         return -1;
@@ -177,24 +183,6 @@ int nvram_init(void) {
     }
     init = 1;
 
-    sem_lock();
-
-    if (mount("tmpfs", MOUNT_POINT, "tmpfs", MS_NOEXEC | MS_NOSUID | MS_SYNCHRONOUS, "") == -1) {
-        sem_unlock();
-        PRINT_MSG("Unable to mount tmpfs on mount point %s!\n", MOUNT_POINT);
-        return E_FAILURE;
-    }
-
-    // Checked by certain Ralink routers
-    if ((f = fopen("/var/run/nvramd.pid", "w+")) == NULL) {
-        PRINT_MSG("Unable to touch Ralink PID file: %s!\n", "/var/run/nvramd.pid");
-    }
-    else {
-        fclose(f);
-    }
-
-    sem_unlock();
-
     return nvram_set_default();
 }
 
@@ -210,40 +198,8 @@ int nvram_reset(void) {
 }
 
 int nvram_clear(void) {
-    char path[PATH_MAX] = MOUNT_POINT;
-    struct dirent *entry;
-    int ret = E_SUCCESS;
-    DIR *dir;
-
     PRINT_MSG("%s\n", "Clearing NVRAM...");
-
-    sem_lock();
-
-    if (!(dir = opendir(MOUNT_POINT))) {
-        sem_unlock();
-        PRINT_MSG("Unable to open directory %s!\n", MOUNT_POINT);
-        return E_FAILURE;
-    }
-
-    while ((entry = readdir(dir))) {
-        if (!strncmp(entry->d_name, ".", 1) || !strcmp(entry->d_name, "..")) {
-            PRINT_MSG("Skipping %s\n", entry->d_name);
-            continue;
-        }
-
-        strncpy(path + strlen(MOUNT_POINT), entry->d_name, ARRAY_SIZE(path) - ARRAY_SIZE(MOUNT_POINT) - 1);
-        path[PATH_MAX - 1] = '\0';
-
-        PRINT_MSG("%s\n", path);
-
-        if (unlink(path) == -1 && errno != ENOENT) {
-            PRINT_MSG("Unable to unlink %s!\n", path);
-            ret = E_FAILURE;
-        }
-    }
-
-    closedir(dir);
-    sem_unlock();
+    int ret = nvram_clear_defaults();
     return ret;
 }
 
@@ -257,7 +213,7 @@ int nvram_list_add(const char *key, const char *val) {
 
     PRINT_MSG("%s = %s + %s\n", val, temp, key);
 
-    if (nvram_get_buf(key, temp, BUFFER_SIZE) != E_SUCCESS) {
+    if (nvram_get_buf(key, temp, BUFFER_SIZE, "nvram_list_add") != E_SUCCESS) {
         return nvram_set(key, val);
     }
 
@@ -290,7 +246,7 @@ int nvram_list_add(const char *key, const char *val) {
 char *nvram_list_exist(const char *key, const char *val, int magic) {
     char *pos = NULL;
 
-    if (nvram_get_buf(key, temp, BUFFER_SIZE) != E_SUCCESS) {
+    if (nvram_get_buf(key, temp, BUFFER_SIZE, "") != E_SUCCESS) {
         return E_FAILURE;
     }
 
@@ -312,7 +268,7 @@ char *nvram_list_exist(const char *key, const char *val, int magic) {
 int nvram_list_del(const char *key, const char *val) {
     char *pos;
 
-    if (nvram_get_buf(key, temp, BUFFER_SIZE) != E_SUCCESS) {
+    if (nvram_get_buf(key, temp, BUFFER_SIZE, "nvram_list_del") != E_SUCCESS) {
         return E_SUCCESS;
     }
 
@@ -332,7 +288,119 @@ int nvram_list_del(const char *key, const char *val) {
     return nvram_set(key, temp);
 }
 
-char *nvram_get(const char *key) {
+char *replace_char(char *key, char oldchar, char newchar)
+{
+  char *ptr;
+
+  for ( ptr = strchr(key, oldchar); ptr; ptr = strchr(ptr, oldchar) )
+    *ptr = newchar;
+  return key;
+}
+
+char * read_key(const char *key, const char *func_name, int enable_llm)
+{
+    if (!key){
+        PRINT_MSG("NULL get key, func: %s!\n", func_name);
+        return "";
+    }
+
+    if(!func_name){
+        func_name = "nvram_get";
+    }
+
+    PRINT_MSG("get key: %s, func: %s\n", key, func_name);
+
+    FILE *fp;
+    size_t bufsize;
+    char KEY_PATH[512];
+    char KEY_NAME[256];
+    char value[2049];
+
+    memset(KEY_NAME, 0, sizeof(KEY_NAME));
+    memset(KEY_PATH, 0, sizeof(KEY_PATH));
+    snprintf(KEY_NAME, 255, "%s", key);
+    replace_char(KEY_NAME, '/', '_');
+    snprintf(KEY_PATH, 512, "%s/%s", "/fa_nvram", KEY_NAME);
+    if (access(KEY_PATH, F_OK) != 0 && enable_llm){
+        fprintf(stderr, "%s is unknown! try to use LLM for recovery!\n", key);
+        
+        const char *COMMUNICATION_FILE = "/msg_nvram.txt";
+        const char *LOCK_FILE = "/msg_nvram.lock";
+        const int MAX_WAIT_COUNT = 60;
+        int WAIT_COUNT = 0;
+        FILE *fp;
+        
+        while (access(LOCK_FILE, F_OK) == 0) {
+            if (WAIT_COUNT >= MAX_WAIT_COUNT) {
+                fflush(stderr);
+                return -1;
+            }
+            WAIT_COUNT++;
+            sleep(1);
+        }
+        
+        fp = fopen(LOCK_FILE, "w");
+        if (fp != NULL) {
+            fprintf(fp, "%d", getpid());
+            fclose(fp);
+        }
+        
+        remove(COMMUNICATION_FILE);
+        
+        char MESSAGE[256];
+        snprintf(MESSAGE, sizeof(MESSAGE), "--nvram_function_name %s --key %s", func_name, key);
+        
+        fp = fopen(COMMUNICATION_FILE, "w");
+        if (fp != NULL) {
+            fprintf(fp, "%s", MESSAGE);
+            fclose(fp);
+        }
+        
+        remove(LOCK_FILE);
+        fflush(stderr);
+    }
+
+    int max_attempts = 10;
+    int wait_seconds = 1;
+    int attempts = 0;
+    if (!enable_llm){
+        max_attempts = 0;
+    }
+    while (attempts < max_attempts)
+    {
+        if (access(KEY_PATH, F_OK) == 0)
+        {
+            PRINT_MSG("find key %s file\n", KEY_NAME);
+            break;
+        }
+        else
+        {
+            PRINT_MSG("wait key %s file (attempts: %d/%d)...\n",
+                      KEY_PATH, attempts + 1, max_attempts);
+            sleep(wait_seconds); // 等待一段时间再检查
+        }
+        attempts++;
+    }
+
+    fp = fopen(KEY_PATH, "r");
+    if (fp)
+    {
+        PRINT_MSG("open %s success!\n", key);
+        bufsize = fread(value, 1, 2048, fp);
+        fclose(fp);
+        if ( bufsize )
+            return strdup(value);
+        else
+            return "";
+    }
+    else
+    {
+        PRINT_MSG("open %s fail!\n", key);
+        return "";
+    }
+}
+
+char *nvram_get(const char *key, const char *func_name, int enable_llm) {
 // Some routers pass the key as the second argument, instead of the first.
 // We attempt to fix this directly in assembly for MIPS if the key is NULL.
 #if defined(mips)
@@ -341,103 +409,50 @@ char *nvram_get(const char *key) {
     }
 #endif
 
-    return (nvram_get_buf(key, temp, BUFFER_SIZE) == E_SUCCESS) ? strndup(temp, BUFFER_SIZE) : NULL;
+    if (access("/fa_nvram", F_OK))
+        return 0;
+    else
+        return read_key(key, func_name, enable_llm);
 }
 
-char *nvram_safe_get(const char *key) {
-    char* ret = nvram_get(key);
+char *nvram_safe_get(const char *key, const char *func_name) {
+    char* ret = nvram_get(key, func_name, 1);
     return ret ? ret : strdup("");
 }
 
 char *nvram_default_get(const char *key, const char *val) {
-    char *ret = nvram_get(key);
-
-    PRINT_MSG("%s = %s || %s\n", key, ret, val);
+    char *ret = nvram_get(key, "nvram_default_get", 0);
 
     if (ret) {
         return ret;
     }
 
     if (val && nvram_set(key, val)) {
-        return nvram_get(key);
+        return val;
     }
 
     return NULL;
 }
 
-int nvram_get_buf(const char *key, char *buf, size_t sz) {
-    char path[PATH_MAX] = MOUNT_POINT;
-    FILE *f;
-
-    if (!buf) {
-        PRINT_MSG("NULL output buffer, key: %s!\n", key);
+int nvram_get_buf(const char *key, char *buf, size_t sz, const char *func_name) {
+    char *val;
+    if (!buf || !sz) {
         return E_FAILURE;
     }
-
-    if (!key) {
-        PRINT_MSG("NULL input key, buffer: %s!\n", buf);
-        return E_FAILURE;
-    }
-
-    PRINT_MSG("%s\n", key);
-
-    strncat(path, key, ARRAY_SIZE(path) - ARRAY_SIZE(MOUNT_POINT) - 1);
-
-    sem_lock();
-
-    if ((f = fopen(path, "rb")) == NULL) {
-        sem_unlock();
-        PRINT_MSG("Unable to open key: %s!\n", path);
-        return E_FAILURE;
-    }
-
-    buf[0] = '\0';
-    char tmp[sz];
-    while(fgets(tmp, sz, f)) {
-        strncat (buf, tmp, sz);
-    }
-    fclose(f);
-    sem_unlock();
-
-    PRINT_MSG("= \"%s\"\n", buf);
-
+    val = nvram_get(key, func_name, 1);
+    *buf = 0;
+    memcpy(buf, val, sz);
     return E_SUCCESS;
 }
 
-int nvram_get_int(const char *key) {
-    char path[PATH_MAX] = MOUNT_POINT;
-    FILE *f;
-    int ret;
-
+int nvram_get_int(const char *key, const char *func_name) {
     if (!key) {
-        PRINT_MSG("%s\n", "NULL key!");
         return E_FAILURE;
     }
 
-    PRINT_MSG("%s\n", key);
-
-    strncat(path, key, ARRAY_SIZE(path) - ARRAY_SIZE(MOUNT_POINT) - 1);
-
-    sem_lock();
-
-    if ((f = fopen(path, "rb")) == NULL) {
-        sem_unlock();
-        PRINT_MSG("Unable to open key: %s!\n", path);
-        return E_FAILURE;
-    }
-
-    if (fread(&ret, sizeof(ret), 1, f) != 1) {
-        fclose(f);
-        sem_unlock();
-        PRINT_MSG("Unable to read key: %s!\n", path);
-        return E_FAILURE;
-    }
-    fclose(f);
-    sem_unlock();
-
-    PRINT_MSG("= %d\n", ret);
-
-    return ret;
+    const char *ret = nvram_get(key, func_name, 1);
+    int value = atoi(ret);    
+    return value;
 }
 
 int nvram_getall(char *buf, size_t len) {
@@ -511,73 +526,72 @@ int nvram_getall(char *buf, size_t len) {
     return E_SUCCESS;
 }
 
-int nvram_set(const char *key, const char *val) {
-    char path[PATH_MAX] = MOUNT_POINT;
-    FILE *f;
-
-    if (!key || !val) {
-        PRINT_MSG("%s\n", "NULL key or value!");
+int write_key(const char *key, const char *buf)
+{
+    if ( !key || !*key )
         return E_FAILURE;
-    }
 
-    PRINT_MSG("%s = \"%s\"\n", key, val);
+    PRINT_MSG("set key: %s\n", key);
+    PRINT_MSG("set buffer: %s\n", buf);
 
-    strncat(path, key, ARRAY_SIZE(path) - ARRAY_SIZE(MOUNT_POINT) - 1);
-
+    FILE *fp;
+    size_t bufsize;
+    char KEY_PATH[512];
+    char KEY_NAME[256];
+    memset(KEY_NAME, 0, sizeof(KEY_NAME));
+    memset(KEY_PATH, 0, sizeof(KEY_PATH));
+    snprintf(KEY_NAME, 255, "%s", key);
+    replace_char(KEY_NAME, '/', '_');
+    snprintf(KEY_PATH, 512, "%s/%s", "/fa_nvram", KEY_NAME);
     sem_lock();
-
-    if ((f = fopen(path, "wb")) == NULL) {
+    fp = fopen(KEY_PATH, "w");
+    if (!fp) {
         sem_unlock();
-        PRINT_MSG("Unable to open key: %s!\n", path);
         return E_FAILURE;
     }
-
-    if (fwrite(val, sizeof(*val), strlen(val), f) != strlen(val)) {
-        fclose(f);
-        sem_unlock();
-        PRINT_MSG("Unable to write value: %s to key: %s!\n", val, path);
-        return E_FAILURE;
+    fputs(buf, fp);
+    // 如果正在记录默认键，将键写入列表文件
+    if (recording_defaults && defaults_list_fp) {
+        fprintf(defaults_list_fp, "%s\n", key);
     }
-
-    fclose(f);
+    fclose(fp);
     sem_unlock();
     return E_SUCCESS;
+}
+
+int nvram_set(const char *key, const char *val) {
+    if ( access("/fa_nvram", 0) )
+        return E_FAILURE;
+    else
+        return write_key(key, val);
 }
 
 int nvram_set_int(const char *key, const int val) {
-    char path[PATH_MAX] = MOUNT_POINT;
-    FILE *f;
-
-    if (!key) {
-        PRINT_MSG("%s\n", "NULL key!");
-        return E_FAILURE;
-    }
-
-    PRINT_MSG("%s = %d\n", key, val);
-
-    strncat(path, key, ARRAY_SIZE(path) - ARRAY_SIZE(MOUNT_POINT) - 1);
-
-    sem_lock();
-
-    if ((f = fopen(path, "wb")) == NULL) {
-        sem_unlock();
-        PRINT_MSG("Unable to open key: %s!\n", path);
-        return E_FAILURE;
-    }
-
-    if (fwrite(&val, sizeof(val), 1, f) != 1) {
-        fclose(f);
-        sem_unlock();
-        PRINT_MSG("Unable to write value: %d to key: %s!\n", val, path);
-        return E_FAILURE;
-    }
-
-    fclose(f);
-    sem_unlock();
-    return E_SUCCESS;
+    char charval[512]; // [sp+18h] [+18h] BYREF
+    snprintf(charval, 512, "%d", val);
+    return nvram_set(key, charval);
 }
 
 int nvram_set_default(void) {
+    // 在qemu-user环境中，子进程间隔离，使用文件标记避免重复初始化
+    const char *init_marker = "/fa_nvram/.defaults_loaded";
+    const char *defaults_list = "/fa_nvram/.defaults_list";
+    
+    // 检查初始化标记文件是否存在
+    if (!access(init_marker, F_OK)) {
+        PRINT_MSG("Default values already loaded, skipping...\n");
+        return 1;
+    }
+    
+    // 打开默认值列表文件，用于记录所有设置的键
+    defaults_list_fp = fopen(defaults_list, "w");
+    if (!defaults_list_fp) {
+        PRINT_MSG("Warning: Failed to create defaults list file %s!\n", defaults_list);
+    }
+    
+    // 开启记录默认键
+    recording_defaults = 1;
+    
     int ret = nvram_set_default_builtin();
     PRINT_MSG("Loading built-in default values = %d!\n", ret);
 
@@ -601,12 +615,33 @@ int nvram_set_default(void) {
 #undef PATH
 #undef NATIVE
 #undef TABLE
+    
+    // 关闭记录默认键
+    recording_defaults = 0;
+    
+    // 关闭默认值列表文件
+    if (defaults_list_fp) {
+        fclose(defaults_list_fp);
+        defaults_list_fp = NULL;
+        PRINT_MSG("Created defaults list file: %s\n", defaults_list);
+    }
+    
+    // 创建初始化标记文件
+    FILE *marker_fp = fopen(init_marker, "w");
+    if (marker_fp) {
+        fclose(marker_fp);
+        PRINT_MSG("Created initialization marker: %s\n", init_marker);
+    } else {
+        PRINT_MSG("Failed to create initialization marker: %s\n", init_marker);
+    }
 
-    return nvram_set_default_image();
+    return 1;
 }
 
 static int nvram_set_default_builtin(void) {
     int ret = E_SUCCESS;
+    char nvramKeyBuffer[100]="";
+    int index=0;
 
     PRINT_MSG("%s\n", "Setting built-in default values!");
 
@@ -616,18 +651,18 @@ static int nvram_set_default_builtin(void) {
         ret = E_FAILURE; \
     }
 
+#define FOR_ENTRY(a, b, c, d, e) \
+    index = d; \
+    while (index != e) { \
+        snprintf(nvramKeyBuffer, 0x1E, a, index++); \
+        ENTRY(nvramKeyBuffer, b, c) \
+    } \
+
     NVRAM_DEFAULTS
 #undef ENTRY
+#undef FOR_ENTRY
 
     return ret;
-}
-
-static int nvram_set_default_image(void) {
-    PRINT_MSG("%s\n", "Copying overrides from defaults folder!");
-    sem_lock();
-    system("/bin/cp "OVERRIDE_POINT"* "MOUNT_POINT);
-    sem_unlock();
-    return E_SUCCESS;
 }
 
 static int nvram_set_default_table(const char *tbl[]) {
@@ -663,13 +698,13 @@ int nvram_unset(const char *key) {
     return E_SUCCESS;
 }
 
-int nvram_match(const char *key, const char *val) {
+int nvram_match(const char *key, const char *val, const char *func_name) {
     if (!key) {
         PRINT_MSG("%s\n", "NULL key!");
         return E_FAILURE;
     }
 
-    if (nvram_get_buf(key, temp, BUFFER_SIZE) != E_SUCCESS) {
+    if (nvram_get_buf(key, temp, BUFFER_SIZE, func_name) != E_SUCCESS) {
         return !val ? E_SUCCESS : E_FAILURE;
     }
 
@@ -684,14 +719,14 @@ int nvram_match(const char *key, const char *val) {
     return E_SUCCESS;
 }
 
-int nvram_invmatch(const char *key, const char *val) {
+int nvram_invmatch(const char *key, const char *val, const char *func_name) {
     if (!key) {
         PRINT_MSG("%s\n", "NULL key!");
         return E_FAILURE;
     }
 
     PRINT_MSG("%s ~?= \"%s\"\n", key, val);
-    return !nvram_match(key, val);
+    return !nvram_match(key, val, func_name);
 }
 
 int nvram_commit(void) {
@@ -699,6 +734,56 @@ int nvram_commit(void) {
     sync();
     sem_unlock();
 
+    return E_SUCCESS;
+}
+
+// 仅删除nvram_set_default中设置的值
+int nvram_clear_defaults(void) {
+    const char *defaults_list = "/fa_nvram/.defaults_list";
+    char key[512];
+    FILE *fp;
+    
+    PRINT_MSG("Clearing only default NVRAM values...\n");
+    
+    // 检查默认值列表文件是否存在
+    if (access(defaults_list, R_OK)) {
+        PRINT_MSG("Defaults list file %s not found, nothing to clear!\n", defaults_list);
+        return E_SUCCESS;
+    }
+    
+    sem_lock();
+    
+    fp = fopen(defaults_list, "r");
+    if (!fp) {
+        sem_unlock();
+        PRINT_MSG("Failed to open defaults list file %s!\n", defaults_list);
+        return E_FAILURE;
+    }
+    
+    // 遍历列表文件，删除每个键
+    while (fgets(key, sizeof(key), fp)) {
+        // 去除换行符
+        char *newline = strchr(key, '\n');
+        if (newline) {
+            *newline = '\0';
+        }
+        
+        // 删除键
+        if (strlen(key) > 0) {
+            PRINT_MSG("Removing default key: %s\n", key);
+            nvram_unset(key);
+        }
+    }
+    
+    fclose(fp);
+    
+    // 删除列表文件和初始化标记
+    unlink(defaults_list);
+    unlink("/fa_nvram/.defaults_loaded");
+    
+    sem_unlock();
+    
+    PRINT_MSG("Default values cleared successfully!\n");
     return E_SUCCESS;
 }
 

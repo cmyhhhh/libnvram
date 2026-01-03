@@ -18,9 +18,7 @@
 // Timeout for the semaphore
 #define IPC_TIMEOUT         1000
 // Mount point of the base NVRAM implementation.
-#define MOUNT_POINT         "/firmadyne/libnvram/"
-// Location of NVRAM override values that are copied into the base NVRAM implementation.
-#define OVERRIDE_POINT      "/firmadyne/libnvram.override/"
+#define MOUNT_POINT         "/fa_nvram/"
 
 // Define the semantics for success and failure error codes.
 #define E_FAILURE  0
@@ -32,12 +30,9 @@
     PATH("/var/etc/nvram.default") \
     /* "DIR-615_REVE_FIRMWARE_5.11.ZIP" (9753) */ \
     PATH("/etc/nvram.default") \
-    /* "DGL-5500_REVA_FIRMWARE_1.12B05.ZIP" (9469) */ \
-    TABLE(router_defaults) \
     PATH("/etc/nvram.conf") \
     PATH("/etc/nvram.deft") \
     PATH("/etc/nvram.update") \
-    TABLE(Nvrams) \
     PATH("/etc/wlan/nvram_params") \
     PATH("/etc/system_nvram_defaults")
 
@@ -50,11 +45,11 @@
     ENTRY("sku_name", nvram_set, "") \
     ENTRY("wla_wlanstate", nvram_set, "") \
     ENTRY("lan_if", nvram_set, "br0") \
-    ENTRY("lan_ipaddr", nvram_set, "192.168.0.50") \
-    ENTRY("lan_bipaddr", nvram_set, "192.168.0.255") \
+    ENTRY("lan_ipaddr", nvram_set, "172.20.0.2") \
+    ENTRY("lan_bipaddr", nvram_set, "172.20.0.255") \
     ENTRY("lan_netmask", nvram_set, "255.255.255.0") \
     /* Set default timezone, required by multiple images */ \
-    ENTRY("time_zone", nvram_set, "EST5EDT") \
+    ENTRY("time_zone", nvram_set, "PST8PDT") \
     /* Set default WAN MAC address, used by "NBG-416N_V1.00(USA.7)C0.zip" (12786) */ \
     ENTRY("wan_hwaddr_def", nvram_set, "01:23:45:67:89:ab") \
     /* Attempt to define LAN/WAN interfaces */ \
@@ -70,6 +65,19 @@
     /* Used by "DGND3700 Firmware Version 1.0.0.17(NA).zip" (3425) to prevent crashes */ \
     ENTRY("time_zone_x", nvram_set, "0") \
     ENTRY("rip_multicast", nvram_set, "0") \
-    ENTRY("bs_trustedip_enable", nvram_set, "0")
+    ENTRY("bs_trustedip_enable", nvram_set, "0") \
+    /* Set default MAC address, used by "linux-lzma(550A)" by SR */ \
+    ENTRY("et0macaddr", nvram_set, "01:23:45:67:89:ab")\
+    /* Used by Netgear "R6200V2-V1.0.1.14_1.0.14.zip" by SR */ \
+    ENTRY("pppoe2_schedule_config", nvram_set, "127:0:0:23:59") \
+    ENTRY("schedule_config", nvram_set, "127:0:0:23:59") \
+    /* Used by Netgear WNDR3400v3, WNDR3500v3 "WNR3500L-V1.2.0.18_40.0.67" to prevent crashes due to following "atoi" func by SR */ \
+    ENTRY("access_control_mode", nvram_set, "0") \
+    ENTRY("fwpt_df_count", nvram_set, "0") \
+    ENTRY("static_if_status", nvram_set, "1") \
+    /* R8500 patch to prevent crashes in httpd */ \
+    FOR_ENTRY("usb_info_dev%d", nvram_set, "A200396E0402FF83@1@14.4G@U@1@USB_Storage;U:;0;0@", 0, 101) \
+    /* R6400-V1, R7900-V1, R8000, R8500 patch to prevent crashes in httpd */ \
+    FOR_ENTRY("%d:macaddr", nvram_set, "01:23:45:67:89:ab", 0, 3) \
 
 #endif
