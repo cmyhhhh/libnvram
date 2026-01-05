@@ -44,6 +44,10 @@ static char temp[BUFFER_SIZE];
 // 全局标志，用于控制是否记录默认键
 static int recording_defaults = 0;
 static FILE *defaults_list_fp = NULL;
+// TODO: 由于libnvram-faker库是分开加载的，因此每个不同程序的llm_timeout_count是独立的，因此是否可以通过本地文件的方式来共享llm_timeout_count
+// 连续LLM超时计数
+static int llm_timeout_count = 0;
+#define MAX_LLM_TIMEOUT_COUNT 3
 
 static int sem_get() {
     int key, semid = 0;
@@ -321,6 +325,13 @@ char * read_key(const char *key, const char *func_name, int enable_llm)
     snprintf(KEY_NAME, 255, "%s", key);
     replace_char(KEY_NAME, '/', '_');
     snprintf(KEY_PATH, 512, "%s/%s", "/fa_nvram", KEY_NAME);
+    
+    // 检查连续LLM超时计数，如果达到5次则禁用LLM
+    if (llm_timeout_count >= MAX_LLM_TIMEOUT_COUNT) {
+        fprintf(stderr, "LLM has timed out %d times consecutively, disabling LLM for this call!\n", llm_timeout_count);
+        enable_llm = 0;
+    }
+    
     if (access(KEY_PATH, F_OK) != 0 && enable_llm){
         fprintf(stderr, "%s is unknown! try to use LLM for recovery!\n", key);
         
@@ -333,7 +344,9 @@ char * read_key(const char *key, const char *func_name, int enable_llm)
         while (access(LOCK_FILE, F_OK) == 0) {
             if (WAIT_COUNT >= MAX_WAIT_COUNT) {
                 fflush(stderr);
-                return -1;
+                llm_timeout_count++;
+                fprintf(stderr, "LLM lock file wait timeout! Consecutive timeout count: %d\n", llm_timeout_count);
+                return "";
             }
             WAIT_COUNT++;
             sleep(1);
@@ -360,26 +373,35 @@ char * read_key(const char *key, const char *func_name, int enable_llm)
         fflush(stderr);
     }
 
-    int max_attempts = 10;
-    int wait_seconds = 1;
-    int attempts = 0;
-    if (!enable_llm){
-        max_attempts = 0;
-    }
-    while (attempts < max_attempts)
-    {
-        if (access(KEY_PATH, F_OK) == 0)
+    // 只有开启LLM的情况下才需要等待
+    if (enable_llm) {
+        // TODO: 超时时间只考虑了非思考模式下的情况，思考模式下的超时时间需要根据实际情况调整
+        int max_attempts = 20;
+        int wait_seconds = 1;
+        int attempts = 0;
+        int found = 0;
+        while (attempts < max_attempts)
         {
-            PRINT_MSG("find key %s file\n", KEY_NAME);
-            break;
+            if (access(KEY_PATH, F_OK) == 0)
+            {
+                PRINT_MSG("find key %s file\n", KEY_NAME);
+                found = 1;
+                break;
+            }
+            else
+            {
+                PRINT_MSG("wait key %s file (attempts: %d/%d)...\n",
+                          KEY_PATH, attempts + 1, max_attempts);
+                sleep(wait_seconds); // 等待一段时间再检查
+            }
+            attempts++;
         }
-        else
-        {
-            PRINT_MSG("wait key %s file (attempts: %d/%d)...\n",
-                      KEY_PATH, attempts + 1, max_attempts);
-            sleep(wait_seconds); // 等待一段时间再检查
+        
+        // 如果超过最大尝试次数仍未找到，增加超时计数
+        if (!found && attempts >= max_attempts) {
+            llm_timeout_count++;
+            fprintf(stderr, "LLM wait for key file timed out after %d attempts! Consecutive timeout count: %d\n", attempts, llm_timeout_count);
         }
-        attempts++;
     }
 
     fp = fopen(KEY_PATH, "r");
@@ -388,10 +410,14 @@ char * read_key(const char *key, const char *func_name, int enable_llm)
         PRINT_MSG("open %s success!\n", key);
         bufsize = fread(value, 1, 2048, fp);
         fclose(fp);
-        if ( bufsize )
+        if ( bufsize ) {
+            // LLM成功返回结果，重置超时计数
+            llm_timeout_count = 0;
             return strdup(value);
-        else
+        }
+        else {
             return "";
+        }
     }
     else
     {

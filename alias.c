@@ -272,11 +272,18 @@ int apmib_set(const int key, void *buf) {
     char type_buf[8] = {0};
     FILE *pp;
 
+    // 检查连续LLM超时计数，如果达到5次则跳过LLM逻辑
+    if (llm_timeout_count >= MAX_LLM_TIMEOUT_COUNT) {
+        fprintf(stderr, "LLM has timed out %d times consecutively, skipping LLM for this call!\n", llm_timeout_count);
+        strcpy(type_buf, "1");
+        goto cleanup;
+    }
+
     const char *COMMUNICATION_FILE = "/msg_nvram.txt";
     const char *LOCK_FILE = "/msg_nvram.lock";
     const char *REPLY_FILE = "/msg_nvram_reply.txt";
-    const int MAX_WAIT_COUNT = 60;
-    const int MAX_WAIT_REPLY = 60;
+    const int MAX_WAIT_COUNT = 20;
+    const int MAX_WAIT_REPLY = 20;
     int WAIT_COUNT = 0;
     int WAIT_REPLY_COUNT = 0;
     FILE *fp;
@@ -284,6 +291,8 @@ int apmib_set(const int key, void *buf) {
     while (access(LOCK_FILE, F_OK) == 0) {
         if (WAIT_COUNT >= MAX_WAIT_COUNT) {
             strcpy(type_buf, "1");
+            llm_timeout_count++;
+            fprintf(stderr, "LLM lock file wait timeout! Consecutive timeout count: %d\n", llm_timeout_count);
             goto cleanup;
         }
         WAIT_COUNT++;
@@ -314,6 +323,8 @@ int apmib_set(const int key, void *buf) {
         if (WAIT_REPLY_COUNT >= MAX_WAIT_REPLY) {
             fprintf(stderr, "error: timeout waiting for reply\n");
             strcpy(type_buf, "1");
+            llm_timeout_count++;
+            fprintf(stderr, "LLM reply file wait timeout! Consecutive timeout count: %d\n", llm_timeout_count);
             goto cleanup;
         }
         WAIT_REPLY_COUNT++;
@@ -324,6 +335,8 @@ int apmib_set(const int key, void *buf) {
     if (fp != NULL) {
         if (fgets(type_buf, sizeof(type_buf), fp)) {
             type_buf[strcspn(type_buf, "\r\n")] = 0;
+            // LLM成功返回结果，重置超时计数
+            llm_timeout_count = 0;
         } else {
             strcpy(type_buf, "1");
         }
