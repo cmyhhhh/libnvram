@@ -251,7 +251,7 @@ char *nvram_list_exist(const char *key, const char *val, int magic) {
     char *pos = NULL;
 
     if (nvram_get_buf(key, temp, BUFFER_SIZE, "") != E_SUCCESS) {
-        return E_FAILURE;
+        return (magic == LIST_MAGIC) ? NULL : (char *) E_FAILURE;
     }
 
     PRINT_MSG("%s ?in %s (%s)\n", val, key, temp);
@@ -261,8 +261,8 @@ char *nvram_list_exist(const char *key, const char *val, int magic) {
     }
 
     while ((pos = strtok(!pos ? temp : NULL, LIST_SEP))) {
-        if (!strcmp(pos + 1, val)) {
-            return (magic == LIST_MAGIC) ? pos + 1 : (char *) E_SUCCESS;
+        if (!strcmp(pos, val)) {
+            return (magic == LIST_MAGIC) ? pos : (char *) E_SUCCESS;
         }
     }
 
@@ -305,14 +305,14 @@ char * read_key(const char *key, const char *func_name, int enable_llm)
 {
     if (!key){
         PRINT_MSG("NULL get key, func: %s!\n", func_name);
-        return "";
+        return strdup("");
     }
 
     if(!func_name){
         func_name = "nvram_get";
     }
 
-    PRINT_MSG("get key: %s, func: %s\n", key, func_name);
+    // PRINT_MSG("get key: %s, func: %s\n", key, func_name);
 
     FILE *fp;
     size_t bufsize;
@@ -324,7 +324,7 @@ char * read_key(const char *key, const char *func_name, int enable_llm)
     memset(KEY_PATH, 0, sizeof(KEY_PATH));
     snprintf(KEY_NAME, 255, "%s", key);
     replace_char(KEY_NAME, '/', '_');
-    snprintf(KEY_PATH, 512, "%s/%s", "/fa_nvram", KEY_NAME);
+    snprintf(KEY_PATH, 512, "%s/%s", MOUNT_POINT, KEY_NAME);
     
     // 检查连续LLM超时计数，如果达到5次则禁用LLM
     if (llm_timeout_count >= MAX_LLM_TIMEOUT_COUNT) {
@@ -343,11 +343,11 @@ char * read_key(const char *key, const char *func_name, int enable_llm)
         
         while (access(LOCK_FILE, F_OK) == 0) {
             if (WAIT_COUNT >= MAX_WAIT_COUNT) {
-                fflush(stderr);
-                llm_timeout_count++;
-                fprintf(stderr, "LLM lock file wait timeout! Consecutive timeout count: %d\n", llm_timeout_count);
-                return "";
-            }
+            fflush(stderr);
+            llm_timeout_count++;
+            fprintf(stderr, "LLM lock file wait timeout! Consecutive timeout count: %d\n", llm_timeout_count);
+            return strdup("");
+        }
             WAIT_COUNT++;
             sleep(1);
         }
@@ -384,14 +384,14 @@ char * read_key(const char *key, const char *func_name, int enable_llm)
         {
             if (access(KEY_PATH, F_OK) == 0)
             {
-                PRINT_MSG("find key %s file\n", KEY_NAME);
+                // PRINT_MSG("find key %s file\n", KEY_NAME);
                 found = 1;
                 break;
             }
             else
             {
-                PRINT_MSG("wait key %s file (attempts: %d/%d)...\n",
-                          KEY_PATH, attempts + 1, max_attempts);
+                // PRINT_MSG("wait key %s file (attempts: %d/%d)...\n",
+                //           KEY_PATH, attempts + 1, max_attempts);
                 sleep(wait_seconds); // 等待一段时间再检查
             }
             attempts++;
@@ -412,17 +412,20 @@ char * read_key(const char *key, const char *func_name, int enable_llm)
         fclose(fp);
         if ( bufsize ) {
             // LLM成功返回结果，重置超时计数
+            value[bufsize] = '\0';
             llm_timeout_count = 0;
             return strdup(value);
         }
         else {
-            return "";
+            // 文件大小为0，删除该文件
+            unlink(KEY_PATH);
+            return strdup("");
         }
     }
     else
     {
         PRINT_MSG("open %s fail!\n", key);
-        return "";
+        return strdup("");
     }
 }
 
@@ -435,7 +438,7 @@ char *nvram_get(const char *key, const char *func_name, int enable_llm) {
     }
 #endif
 
-    if (access("/fa_nvram", F_OK))
+    if (access(MOUNT_POINT, F_OK))
         return 0;
     else
         return read_key(key, func_name, enable_llm);
@@ -466,6 +469,9 @@ int nvram_get_buf(const char *key, char *buf, size_t sz, const char *func_name) 
         return E_FAILURE;
     }
     val = nvram_get(key, func_name, 1);
+    if (!val) {
+        return E_FAILURE;
+    }
     *buf = 0;
     memcpy(buf, val, sz);
     return E_SUCCESS;
@@ -477,6 +483,9 @@ int nvram_get_int(const char *key, const char *func_name) {
     }
 
     const char *ret = nvram_get(key, func_name, 1);
+    if (!ret) {
+        return E_FAILURE;
+    }
     int value = atoi(ret);    
     return value;
 }
@@ -515,13 +524,15 @@ int nvram_getall(char *buf, size_t len) {
             continue;
         }
 
-        if ((ret = snprintf(buf + pos, len - pos, "%s=", entry->d_name)) != strlen(entry->d_name) + 1) {
-            closedir(dir);
-            sem_unlock();
-            PRINT_MSG("Unable to append key %s!\n", buf + pos);
-            return E_FAILURE;
+        // 检查缓冲区空间是否足够存储键
+        size_t key_len = strlen(entry->d_name) + 1; // +1 用于等号
+        if (pos + key_len > len) {
+            // 缓冲区空间不足，截断数据
+            PRINT_MSG("Buffer overflow! Truncating data.\n");
+            break;
         }
-
+        
+        ret = snprintf(buf + pos, len - pos, "%s=", entry->d_name);
         pos += ret;
 
         if ((f = fopen(path, "rb")) == NULL) {
@@ -540,6 +551,14 @@ int nvram_getall(char *buf, size_t len) {
             return E_FAILURE;
         }
 
+        // 检查缓冲区空间是否足够存储值
+        if (pos + ret + 1 > len) {
+            // 缓冲区空间不足，截断数据
+            PRINT_MSG("Buffer overflow! Truncating data.\n");
+            fclose(f);
+            break;
+        }
+        
         memcpy(buf + pos, temp, ret);
         buf[pos + ret] = '\0';
         pos += ret + 1;
@@ -568,7 +587,7 @@ int write_key(const char *key, const char *buf)
     memset(KEY_PATH, 0, sizeof(KEY_PATH));
     snprintf(KEY_NAME, 255, "%s", key);
     replace_char(KEY_NAME, '/', '_');
-    snprintf(KEY_PATH, 512, "%s/%s", "/fa_nvram", KEY_NAME);
+    snprintf(KEY_PATH, 512, "%s/%s", MOUNT_POINT, KEY_NAME);
     sem_lock();
     fp = fopen(KEY_PATH, "w");
     if (!fp) {
@@ -586,7 +605,7 @@ int write_key(const char *key, const char *buf)
 }
 
 int nvram_set(const char *key, const char *val) {
-    if ( access("/fa_nvram", 0) )
+    if ( access(MOUNT_POINT, 0) )
         return E_FAILURE;
     else
         return write_key(key, val);
@@ -600,8 +619,8 @@ int nvram_set_int(const char *key, const int val) {
 
 int nvram_set_default(void) {
     // 在qemu-user环境中，子进程间隔离，使用文件标记避免重复初始化
-    const char *init_marker = "/fa_nvram/.defaults_loaded";
-    const char *defaults_list = "/fa_nvram/.defaults_list";
+    const char *init_marker = MOUNT_POINT ".defaults_loaded";
+    const char *defaults_list = MOUNT_POINT ".defaults_list";
     
     // 检查初始化标记文件是否存在
     if (!access(init_marker, F_OK)) {
@@ -765,7 +784,7 @@ int nvram_commit(void) {
 
 // 仅删除nvram_set_default中设置的值
 int nvram_clear_defaults(void) {
-    const char *defaults_list = "/fa_nvram/.defaults_list";
+    const char *defaults_list = MOUNT_POINT ".defaults_list";
     char key[512];
     FILE *fp;
     
@@ -797,7 +816,12 @@ int nvram_clear_defaults(void) {
         // 删除键
         if (strlen(key) > 0) {
             PRINT_MSG("Removing default key: %s\n", key);
-            nvram_unset(key);
+            // 直接执行删除操作，而不是调用 nvram_unset 函数，避免死锁
+            char path[PATH_MAX] = MOUNT_POINT;
+            strncat(path, key, ARRAY_SIZE(path) - ARRAY_SIZE(MOUNT_POINT) - 1);
+            if (unlink(path) == -1 && errno != ENOENT) {
+                PRINT_MSG("Unable to unlink %s!\n", path);
+            }
         }
     }
     
@@ -805,7 +829,7 @@ int nvram_clear_defaults(void) {
     
     // 删除列表文件和初始化标记
     unlink(defaults_list);
-    unlink("/fa_nvram/.defaults_loaded");
+    unlink(MOUNT_POINT ".defaults_loaded");
     
     sem_unlock();
     

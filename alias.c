@@ -483,30 +483,30 @@ int envram_getf(const char* key, const char *fmt, ...) {
     char *val = nvram_get(key, "envram_getf", 1);
 
     if (!val) {
-        return !E_SUCCESS;
+        return E_FAILURE;
     }
 
     va_start(va, fmt);
-    vsscanf(val, fmt, va);
+    int ret = vsscanf(val, fmt, va);
     va_end(va);
 
     free(val);
-    return !E_FAILURE;
+    return ret == 0 ? E_FAILURE : E_SUCCESS;
 }
 int nvram_getf(const char* key, const char *fmt, ...){
     va_list va;
     char *val = nvram_get(key, "nvram_getf", 1);
 
     if (!val) {
-        return !E_SUCCESS;
+        return E_FAILURE;
     }
 
     va_start(va, fmt);
-    vsscanf(val, fmt, va);
+    int ret = vsscanf(val, fmt, va);
     va_end(va);
 
     free(val);
-    return !E_FAILURE;
+    return ret == 0 ? E_FAILURE : E_SUCCESS;
 }
 
 int envram_set(const char *key, const char *val) {
